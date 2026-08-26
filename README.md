@@ -53,15 +53,14 @@ cargo build --release
 
 Only the fields both formats agree on: feed title, link/home page URL,
 description, and per-item title, link/URL, description/content, guid/id,
-and publish date. RSS `pubDate` and JSON Feed `date_published` are copied
-across as-is without reparsing, since they use different date formats
-(RFC 822 vs ISO 8601) - fixing that up is on the list below.
+and publish date. `pubDate` and `date_published` use different date formats
+(RFC 822 vs ISO 8601), so the publish date is reparsed and reformatted for
+whichever format it's being written to; a date that fails to parse is passed
+through unchanged instead of being dropped.
 
 ## Known limitations
 
 - No Atom support, only RSS 2.0 and JSON Feed 1.1.
-- Publish dates pass through unconverted rather than being reparsed into the
-  target format's date style.
 - No support for enclosures, categories, or other extension fields - they're
   silently dropped on conversion.
 - The XML reader is a small hand-written scanner built for the shape of RSS
@@ -69,8 +68,6 @@ across as-is without reparsing, since they use different date formats
 
 ## Roadmap
 
-- Convert `pubDate` and `date_published` between RFC 822 and ISO 8601
-  instead of passing the raw string through.
 - Read and write Atom as a third format.
 - Carry over enclosures / attachments.
 - Unit tests for the XML and JSON parsing helpers.

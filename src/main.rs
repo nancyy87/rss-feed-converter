@@ -1,3 +1,4 @@
+mod date;
 mod feed;
 
 use feed::Feed;

@@ -209,7 +209,8 @@ pub fn write_rss(feed: &Feed) -> String {
             out.push_str(&format!("<guid>{}</guid>\n", escape_xml(&item.id)));
         }
         if !item.pub_date.is_empty() {
-            out.push_str(&format!("<pubDate>{}</pubDate>\n", escape_xml(&item.pub_date)));
+            let pub_date = crate::date::to_rfc822(&item.pub_date);
+            out.push_str(&format!("<pubDate>{}</pubDate>\n", escape_xml(&pub_date)));
         }
         out.push_str("</item>\n");
     }
@@ -499,7 +500,7 @@ pub fn write_json_feed(feed: &Feed) -> String {
             out.push_str(",\n");
             out.push_str(&format!(
                 "      \"date_published\": \"{}\"\n",
-                json_escape(&item.pub_date)
+                json_escape(&crate::date::to_iso8601(&item.pub_date))
             ));
         } else {
             out.push('\n');
