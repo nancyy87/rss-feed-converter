@@ -10,26 +10,27 @@ use std::process::ExitCode;
 #[derive(Clone, Copy)]
 enum Format {
     Rss,
+    Atom,
     JsonFeed,
 }
 
 fn detect_format(input: &str) -> Option<Format> {
-    for c in input.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        return match c {
-            '<' => Some(Format::Rss),
-            '{' => Some(Format::JsonFeed),
-            _ => None,
-        };
+    let trimmed = input.trim_start();
+    match trimmed.chars().next()? {
+        '{' => Some(Format::JsonFeed),
+        '<' => match feed::xml_root_tag(trimmed) {
+            Some(tag) if tag.eq_ignore_ascii_case("feed") => Some(Format::Atom),
+            Some(_) => Some(Format::Rss),
+            None => None,
+        },
+        _ => None,
     }
-    None
 }
 
 fn parse_format_flag(name: &str) -> Option<Format> {
     match name {
         "rss" => Some(Format::Rss),
+        "atom" => Some(Format::Atom),
         "json" | "jsonfeed" => Some(Format::JsonFeed),
         _ => None,
     }
@@ -47,13 +48,14 @@ fn read_input(path: Option<&str>) -> io::Result<String> {
 }
 
 fn print_usage() {
-    eprintln!("feedconv - convert between RSS 2.0 and JSON Feed 1.1");
+    eprintln!("feedconv - convert between RSS 2.0, Atom, and JSON Feed 1.1");
     eprintln!();
     eprintln!("usage:");
-    eprintln!("  feedconv [--to rss|json] [FILE]");
+    eprintln!("  feedconv [--to rss|atom|json] [FILE]");
     eprintln!();
     eprintln!("  FILE defaults to '-', meaning read from stdin.");
-    eprintln!("  --to picks the output format; if omitted, it's the opposite of the detected input.");
+    eprintln!("  --to picks the output format; if omitted, RSS and Atom input convert to");
+    eprintln!("  JSON Feed, and JSON Feed input converts to RSS.");
 }
 
 fn run() -> Result<(), String> {
@@ -63,7 +65,7 @@ fn run() -> Result<(), String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--to" => {
-                let value = args.next().ok_or("--to requires a value (rss or json)")?;
+                let value = args.next().ok_or("--to requires a value (rss, atom, or json)")?;
                 to_format = Some(
                     parse_format_flag(&value).ok_or_else(|| format!("unknown format '{}'", value))?,
                 );
@@ -88,16 +90,19 @@ fn run() -> Result<(), String> {
 
     let target_format = to_format.unwrap_or(match source_format {
         Format::Rss => Format::JsonFeed,
+        Format::Atom => Format::JsonFeed,
         Format::JsonFeed => Format::Rss,
     });
 
     let parsed: Feed = match source_format {
         Format::Rss => feed::parse_rss(&input)?,
+        Format::Atom => feed::parse_atom(&input)?,
         Format::JsonFeed => feed::parse_json_feed(&input)?,
     };
 
     let output = match target_format {
         Format::Rss => feed::write_rss(&parsed),
+        Format::Atom => feed::write_atom(&parsed),
         Format::JsonFeed => feed::write_json_feed(&parsed),
     };
 

@@ -1,6 +1,6 @@
 // Shared feed model plus hand-rolled XML and JSON handling. No third-party
-// crates, so both formats get just enough of a parser to round-trip the
-// fields RSS 2.0 and JSON Feed 1.1 actually share.
+// crates, so each format gets just enough of a parser to round-trip the
+// fields RSS 2.0, Atom, and JSON Feed 1.1 actually share.
 
 pub struct Feed {
     pub title: String,
@@ -154,6 +154,106 @@ fn extract_all_tag(s: &str, tag: &str) -> Vec<String> {
     result
 }
 
+/// Finds every top-level `<tag ...>` opening tag in `s` (self-closing or
+/// not) and returns each one's raw attribute text, so callers can pull
+/// attribute values out of elements like Atom's `<link href="...">`.
+fn extract_all_tag_attrs(s: &str, tag: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let open_needle = format!("<{}", tag);
+    let mut pos = 0;
+    while let Some(rel) = s[pos..].find(&open_needle) {
+        let start = pos + rel;
+        let after = start + open_needle.len();
+        let next_char = match s[after..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        if !is_tag_boundary(next_char) {
+            pos = after;
+            continue;
+        }
+        let close_of_open = match s[after..].find('>') {
+            Some(i) => after + i,
+            None => break,
+        };
+        result.push(s[after..close_of_open].to_string());
+        pos = close_of_open + 1;
+    }
+    result
+}
+
+/// Reads `attr="value"` (or `attr='value'`) out of a tag's raw attribute
+/// text, as produced by `extract_all_tag_attrs`.
+fn extract_attr_value(tag_attrs: &str, attr: &str) -> Option<String> {
+    let needle = format!("{}=", attr);
+    let mut idx = 0;
+    while let Some(rel) = tag_attrs[idx..].find(&needle) {
+        let pos = idx + rel;
+        if pos > 0 && !tag_attrs.as_bytes()[pos - 1].is_ascii_whitespace() {
+            idx = pos + needle.len();
+            continue;
+        }
+        let after_eq = pos + needle.len();
+        let quote = tag_attrs[after_eq..].chars().next()?;
+        if quote != '"' && quote != '\'' {
+            idx = after_eq;
+            continue;
+        }
+        let value_start = after_eq + quote.len_utf8();
+        let rel_end = tag_attrs[value_start..].find(quote)?;
+        return Some(decode_entities(&tag_attrs[value_start..value_start + rel_end]));
+    }
+    None
+}
+
+/// Picks the href of an Atom `<link>` element, preferring `rel="alternate"`
+/// (the default per the spec when `rel` is omitted) over other relations
+/// like `self` or `enclosure`.
+fn atom_link_href(s: &str) -> String {
+    let mut fallback = None;
+    for attrs in extract_all_tag_attrs(s, "link") {
+        let rel = extract_attr_value(&attrs, "rel");
+        if let Some(href) = extract_attr_value(&attrs, "href") {
+            if rel.is_none() || rel.as_deref() == Some("alternate") {
+                return href;
+            }
+            fallback.get_or_insert(href);
+        }
+    }
+    fallback.unwrap_or_default()
+}
+
+/// Finds the root element name of an XML document, skipping the `<?xml?>`
+/// declaration, comments, and doctype. Used to tell an RSS `<rss>` document
+/// apart from an Atom `<feed>` document before picking a parser.
+pub fn xml_root_tag(s: &str) -> Option<String> {
+    let mut idx = 0;
+    loop {
+        while idx < s.len() && s.as_bytes()[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= s.len() || s.as_bytes()[idx] != b'<' {
+            return None;
+        }
+        let rest = &s[idx..];
+        if rest.starts_with("<?") {
+            idx += rest.find("?>")? + 2;
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            idx += rest.find("-->")? + 3;
+            continue;
+        }
+        if rest.starts_with("<!") {
+            idx += rest.find('>')? + 1;
+            continue;
+        }
+        let after = idx + 1;
+        let name_end = s[after..].find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
+        return Some(s[after..after + name_end].to_string());
+    }
+}
+
 pub fn parse_rss(xml: &str) -> Result<Feed, String> {
     let channel = extract_tag(xml, "channel").ok_or("no <channel> element found")?;
     let mut feed = Feed {
@@ -181,6 +281,19 @@ fn escape_xml(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_xml_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
             _ => out.push(c),
         }
     }
@@ -215,6 +328,93 @@ pub fn write_rss(feed: &Feed) -> String {
         out.push_str("</item>\n");
     }
     out.push_str("</channel>\n</rss>\n");
+    out
+}
+
+// ---------- Atom ----------
+
+pub fn parse_atom(xml: &str) -> Result<Feed, String> {
+    let root = extract_tag(xml, "feed").ok_or("no <feed> element found")?;
+    let mut feed = Feed {
+        title: extract_tag(&root, "title").unwrap_or_default(),
+        link: atom_link_href(&root),
+        description: extract_tag(&root, "subtitle").unwrap_or_default(),
+        items: Vec::new(),
+    };
+    for raw_entry in extract_all_tag(&root, "entry") {
+        let content = extract_tag(&raw_entry, "content")
+            .or_else(|| extract_tag(&raw_entry, "summary"))
+            .unwrap_or_default();
+        let pub_date = extract_tag(&raw_entry, "published")
+            .or_else(|| extract_tag(&raw_entry, "updated"))
+            .unwrap_or_default();
+        feed.items.push(Item {
+            id: extract_tag(&raw_entry, "id").unwrap_or_default(),
+            title: extract_tag(&raw_entry, "title").unwrap_or_default(),
+            link: atom_link_href(&raw_entry),
+            content,
+            pub_date,
+        });
+    }
+    Ok(feed)
+}
+
+pub fn write_atom(feed: &Feed) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
+    out.push_str(&format!("<title>{}</title>\n", escape_xml(&feed.title)));
+    // Atom requires a feed <id>; fall back to the title when there's no link
+    // to use, since the source feed may not carry anything id-shaped at all.
+    let feed_id = if !feed.link.is_empty() { &feed.link } else { &feed.title };
+    out.push_str(&format!("<id>{}</id>\n", escape_xml(feed_id)));
+    if !feed.link.is_empty() {
+        out.push_str(&format!(
+            "<link href=\"{}\" rel=\"alternate\"/>\n",
+            escape_xml_attr(&feed.link)
+        ));
+    }
+    if !feed.description.is_empty() {
+        out.push_str(&format!("<subtitle>{}</subtitle>\n", escape_xml(&feed.description)));
+    }
+    // Atom also requires feed <updated>; use the newest item date we have.
+    let feed_updated = feed
+        .items
+        .iter()
+        .map(|item| item.pub_date.as_str())
+        .find(|d| !d.is_empty())
+        .map(crate::date::to_iso8601)
+        .unwrap_or_default();
+    if !feed_updated.is_empty() {
+        out.push_str(&format!("<updated>{}</updated>\n", escape_xml(&feed_updated)));
+    }
+    for item in &feed.items {
+        out.push_str("<entry>\n");
+        out.push_str(&format!("<title>{}</title>\n", escape_xml(&item.title)));
+        let entry_id = if !item.id.is_empty() { &item.id } else { &item.link };
+        if !entry_id.is_empty() {
+            out.push_str(&format!("<id>{}</id>\n", escape_xml(entry_id)));
+        }
+        if !item.link.is_empty() {
+            out.push_str(&format!(
+                "<link href=\"{}\" rel=\"alternate\"/>\n",
+                escape_xml_attr(&item.link)
+            ));
+        }
+        if !item.content.is_empty() {
+            out.push_str(&format!(
+                "<content type=\"html\">{}</content>\n",
+                escape_xml(&item.content)
+            ));
+        }
+        if !item.pub_date.is_empty() {
+            let updated = crate::date::to_iso8601(&item.pub_date);
+            out.push_str(&format!("<updated>{}</updated>\n", escape_xml(&updated)));
+            out.push_str(&format!("<published>{}</published>\n", escape_xml(&updated)));
+        }
+        out.push_str("</entry>\n");
+    }
+    out.push_str("</feed>\n");
     out
 }
 
