@@ -53,12 +53,18 @@ cargo build --release
 
 Only the fields all three formats agree on: feed title, link/home page
 URL/alternate link, description/subtitle, and per-item title, link/URL,
-description-or-content/summary, guid/id, and publish date. RSS uses
-`pubDate`, JSON Feed uses `date_published`, and Atom uses `published` (with
-`updated` as a fallback on read and mirrored on write) - all three date
-formats get reparsed and reformatted for whichever format is being written;
-a date that fails to parse is passed through unchanged instead of being
-dropped.
+description-or-content/summary, guid/id, publish date, and enclosures. RSS
+uses `pubDate`, JSON Feed uses `date_published`, and Atom uses `published`
+(with `updated` as a fallback on read and mirrored on write) - all three
+date formats get reparsed and reformatted for whichever format is being
+written; a date that fails to parse is passed through unchanged instead of
+being dropped.
+
+Enclosures round-trip too: RSS `<enclosure url="..." type="..."
+length="...">`, JSON Feed's `attachments` array (`url`, `mime_type`,
+`size_in_bytes`), and Atom's `<link rel="enclosure">` all map onto the same
+url/mime-type/length triple, so a podcast episode's audio file survives a
+conversion in either direction.
 
 Atom's `<link>` is attribute-based rather than text content, and a feed or
 entry can carry several of them (`alternate`, `self`, `enclosure`, ...); the
@@ -70,8 +76,8 @@ nothing better is available.
 
 ## Known limitations
 
-- No support for enclosures, categories, or other extension fields - they're
-  silently dropped on conversion.
+- No support for categories or other extension fields - they're silently
+  dropped on conversion.
 - The XML reader is a small hand-written scanner built for the shape of RSS
   2.0 and Atom specifically, not a general-purpose XML parser. Atom
   `<content type="xhtml">` bodies (inline XML rather than escaped text)
@@ -79,7 +85,6 @@ nothing better is available.
 
 ## Roadmap
 
-- Carry over enclosures / attachments.
 - Unit tests for the XML and JSON parsing helpers.
 - Preserve unknown extension fields instead of dropping them.
 

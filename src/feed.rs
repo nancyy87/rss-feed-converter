@@ -15,6 +15,13 @@ pub struct Item {
     pub link: String,
     pub content: String,
     pub pub_date: String,
+    pub enclosures: Vec<Enclosure>,
+}
+
+pub struct Enclosure {
+    pub url: String,
+    pub mime_type: String,
+    pub length: Option<u64>,
 }
 
 // ---------- minimal XML reading ----------
@@ -254,6 +261,20 @@ pub fn xml_root_tag(s: &str) -> Option<String> {
     }
 }
 
+/// Reads every top-level `<enclosure url="..." type="..." length="...">` in
+/// `s`, skipping any that lack a `url` (the only attribute RSS requires).
+fn parse_enclosures_rss(s: &str) -> Vec<Enclosure> {
+    extract_all_tag_attrs(s, "enclosure")
+        .iter()
+        .filter_map(|attrs| {
+            let url = extract_attr_value(attrs, "url")?;
+            let mime_type = extract_attr_value(attrs, "type").unwrap_or_default();
+            let length = extract_attr_value(attrs, "length").and_then(|s| s.parse().ok());
+            Some(Enclosure { url, mime_type, length })
+        })
+        .collect()
+}
+
 pub fn parse_rss(xml: &str) -> Result<Feed, String> {
     let channel = extract_tag(xml, "channel").ok_or("no <channel> element found")?;
     let mut feed = Feed {
@@ -269,6 +290,7 @@ pub fn parse_rss(xml: &str) -> Result<Feed, String> {
             link: extract_tag(&raw_item, "link").unwrap_or_default(),
             content: extract_tag(&raw_item, "description").unwrap_or_default(),
             pub_date: extract_tag(&raw_item, "pubDate").unwrap_or_default(),
+            enclosures: parse_enclosures_rss(&raw_item),
         });
     }
     Ok(feed)
@@ -325,6 +347,18 @@ pub fn write_rss(feed: &Feed) -> String {
             let pub_date = crate::date::to_rfc822(&item.pub_date);
             out.push_str(&format!("<pubDate>{}</pubDate>\n", escape_xml(&pub_date)));
         }
+        for enclosure in &item.enclosures {
+            out.push_str(&format!(
+                "<enclosure url=\"{}\"{}{}/>\n",
+                escape_xml_attr(&enclosure.url),
+                if enclosure.mime_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" type=\"{}\"", escape_xml_attr(&enclosure.mime_type))
+                },
+                enclosure.length.map(|l| format!(" length=\"{}\"", l)).unwrap_or_default()
+            ));
+        }
         out.push_str("</item>\n");
     }
     out.push_str("</channel>\n</rss>\n");
@@ -332,6 +366,22 @@ pub fn write_rss(feed: &Feed) -> String {
 }
 
 // ---------- Atom ----------
+
+/// Reads every `<link rel="enclosure" href="..." type="..." length="...">`
+/// in `s`. Atom marks enclosures via the link relation rather than a
+/// dedicated element, unlike RSS.
+fn parse_enclosures_atom(s: &str) -> Vec<Enclosure> {
+    extract_all_tag_attrs(s, "link")
+        .iter()
+        .filter(|attrs| extract_attr_value(attrs, "rel").as_deref() == Some("enclosure"))
+        .filter_map(|attrs| {
+            let url = extract_attr_value(attrs, "href")?;
+            let mime_type = extract_attr_value(attrs, "type").unwrap_or_default();
+            let length = extract_attr_value(attrs, "length").and_then(|s| s.parse().ok());
+            Some(Enclosure { url, mime_type, length })
+        })
+        .collect()
+}
 
 pub fn parse_atom(xml: &str) -> Result<Feed, String> {
     let root = extract_tag(xml, "feed").ok_or("no <feed> element found")?;
@@ -354,6 +404,7 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
             link: atom_link_href(&raw_entry),
             content,
             pub_date,
+            enclosures: parse_enclosures_atom(&raw_entry),
         });
     }
     Ok(feed)
@@ -412,6 +463,18 @@ pub fn write_atom(feed: &Feed) -> String {
             out.push_str(&format!("<updated>{}</updated>\n", escape_xml(&updated)));
             out.push_str(&format!("<published>{}</published>\n", escape_xml(&updated)));
         }
+        for enclosure in &item.enclosures {
+            out.push_str(&format!(
+                "<link rel=\"enclosure\" href=\"{}\"{}{}/>\n",
+                escape_xml_attr(&enclosure.url),
+                if enclosure.mime_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" type=\"{}\"", escape_xml_attr(&enclosure.mime_type))
+                },
+                enclosure.length.map(|l| format!(" length=\"{}\"", l)).unwrap_or_default()
+            ));
+        }
         out.push_str("</entry>\n");
     }
     out.push_str("</feed>\n");
@@ -447,6 +510,13 @@ impl JsonValue {
     pub fn as_array(&self) -> Option<&Vec<JsonValue>> {
         match self {
             JsonValue::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            JsonValue::Number(n) if *n >= 0.0 => Some(*n as u64),
             _ => None,
         }
     }
@@ -643,6 +713,25 @@ pub fn parse_json_feed(input: &str) -> Result<Feed, String> {
                 .and_then(JsonValue::as_str)
                 .unwrap_or("")
                 .to_string();
+            let enclosures = entry
+                .get("attachments")
+                .and_then(JsonValue::as_array)
+                .map(|attachments| {
+                    attachments
+                        .iter()
+                        .filter_map(|a| {
+                            let url = a.get("url").and_then(JsonValue::as_str)?.to_string();
+                            let mime_type = a
+                                .get("mime_type")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let length = a.get("size_in_bytes").and_then(JsonValue::as_u64);
+                            Some(Enclosure { url, mime_type, length })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             feed.items.push(Item {
                 id: entry.get("id").and_then(JsonValue::as_str).unwrap_or("").to_string(),
                 title: entry.get("title").and_then(JsonValue::as_str).unwrap_or("").to_string(),
@@ -653,6 +742,7 @@ pub fn parse_json_feed(input: &str) -> Result<Feed, String> {
                     .and_then(JsonValue::as_str)
                     .unwrap_or("")
                     .to_string(),
+                enclosures,
             });
         }
     }
@@ -699,12 +789,33 @@ pub fn write_json_feed(feed: &Feed) -> String {
         if !item.pub_date.is_empty() {
             out.push_str(",\n");
             out.push_str(&format!(
-                "      \"date_published\": \"{}\"\n",
+                "      \"date_published\": \"{}\"",
                 json_escape(&crate::date::to_iso8601(&item.pub_date))
             ));
-        } else {
-            out.push('\n');
         }
+        if !item.enclosures.is_empty() {
+            out.push_str(",\n      \"attachments\": [\n");
+            for (j, enclosure) in item.enclosures.iter().enumerate() {
+                out.push_str("        {\n");
+                out.push_str(&format!("          \"url\": \"{}\",\n", json_escape(&enclosure.url)));
+                out.push_str(&format!(
+                    "          \"mime_type\": \"{}\"",
+                    json_escape(&enclosure.mime_type)
+                ));
+                if let Some(length) = enclosure.length {
+                    out.push_str(&format!(",\n          \"size_in_bytes\": {}\n", length));
+                } else {
+                    out.push('\n');
+                }
+                out.push_str("        }");
+                if j + 1 < item.enclosures.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str("      ]");
+        }
+        out.push('\n');
         out.push_str("    }");
         if i + 1 < feed.items.len() {
             out.push(',');
