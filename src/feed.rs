@@ -826,3 +826,164 @@ pub fn write_json_feed(feed: &Feed) -> String {
     out.push_str("}\n");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_entities_handles_named_and_numeric() {
+        assert_eq!(decode_entities("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'");
+        assert_eq!(decode_entities("&#65;&#x41;"), "AA");
+    }
+
+    #[test]
+    fn decode_entities_passes_through_unknown_and_unterminated() {
+        assert_eq!(decode_entities("&unknown;"), "&unknown;");
+        assert_eq!(decode_entities("100% & rising"), "100% & rising");
+    }
+
+    #[test]
+    fn strip_cdata_keeps_markup_raw() {
+        assert_eq!(strip_cdata("  <![CDATA[<b>bold</b>]]>  "), "<b>bold</b>");
+        assert_eq!(strip_cdata("hello &amp; world"), "hello & world");
+    }
+
+    #[test]
+    fn extract_tag_reads_simple_content() {
+        assert_eq!(
+            extract_tag("<title>Hello</title>", "title"),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tag_treats_self_closing_as_empty() {
+        assert_eq!(extract_tag("<link/>", "link"), Some(String::new()));
+    }
+
+    #[test]
+    fn extract_tag_does_not_match_longer_tag_names() {
+        // A naive substring search would stop at <titles>; the boundary
+        // check must skip it and find the real <title> that follows.
+        let xml = "<titles>wrong</titles><title>right</title>";
+        assert_eq!(extract_tag(xml, "title"), Some("right".to_string()));
+    }
+
+    #[test]
+    fn extract_all_tag_finds_every_block() {
+        let xml = "<item>a</item><item>b</item>";
+        assert_eq!(extract_all_tag(xml, "item"), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn extract_attr_value_reads_both_quote_styles() {
+        let attrs = " href=\"a\" rel='self'";
+        assert_eq!(extract_attr_value(attrs, "href"), Some("a".to_string()));
+        assert_eq!(extract_attr_value(attrs, "rel"), Some("self".to_string()));
+    }
+
+    #[test]
+    fn extract_attr_value_ignores_attribute_name_substrings() {
+        // "xhref" contains "href" but is a different attribute entirely.
+        assert_eq!(extract_attr_value(" xhref=\"a\"", "href"), None);
+    }
+
+    #[test]
+    fn atom_link_href_prefers_alternate_over_other_rels() {
+        let xml = "<link rel=\"self\" href=\"http://self\"/><link href=\"http://alt\"/>";
+        assert_eq!(atom_link_href(xml), "http://alt");
+    }
+
+    #[test]
+    fn atom_link_href_falls_back_when_no_alternate_present() {
+        let xml = "<link rel=\"self\" href=\"http://self\"/>";
+        assert_eq!(atom_link_href(xml), "http://self");
+    }
+
+    #[test]
+    fn xml_root_tag_skips_declaration_and_comments() {
+        let xml = "<?xml version=\"1.0\"?><!-- note --><rss version=\"2.0\"><channel/></rss>";
+        assert_eq!(xml_root_tag(xml), Some("rss".to_string()));
+    }
+
+    #[test]
+    fn xml_root_tag_detects_atom_feed() {
+        let xml = "<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>";
+        assert_eq!(xml_root_tag(xml), Some("feed".to_string()));
+    }
+
+    #[test]
+    fn parse_enclosures_rss_skips_entries_missing_url() {
+        let xml = r#"<enclosure url="http://a/mp3" type="audio/mpeg" length="100"/><enclosure type="audio/mpeg"/>"#;
+        let enclosures = parse_enclosures_rss(xml);
+        assert_eq!(enclosures.len(), 1);
+        assert_eq!(enclosures[0].url, "http://a/mp3");
+        assert_eq!(enclosures[0].mime_type, "audio/mpeg");
+        assert_eq!(enclosures[0].length, Some(100));
+    }
+
+    #[test]
+    fn escape_xml_escapes_reserved_characters_only() {
+        assert_eq!(escape_xml("a < b & c > d \"e\""), "a &lt; b &amp; c &gt; d \"e\"");
+    }
+
+    #[test]
+    fn escape_xml_attr_also_escapes_quotes() {
+        assert_eq!(escape_xml_attr("a \"quoted\" & b"), "a &quot;quoted&quot; &amp; b");
+    }
+
+    #[test]
+    fn parse_json_reads_nested_structures() {
+        let value = parse_json(r#"{"a": 1, "b": [true, false, null], "c": {"d": "x\ny"}}"#).unwrap();
+        assert_eq!(value.get("a").and_then(JsonValue::as_u64), Some(1));
+        let b = value.get("b").and_then(JsonValue::as_array).unwrap();
+        assert_eq!(b.len(), 3);
+        assert!(matches!(b[0], JsonValue::Bool(true)));
+        assert!(matches!(b[1], JsonValue::Bool(false)));
+        assert!(matches!(b[2], JsonValue::Null));
+        let d = value.get("c").and_then(|c| c.get("d")).and_then(JsonValue::as_str);
+        assert_eq!(d, Some("x\ny"));
+    }
+
+    #[test]
+    fn parse_json_reads_unicode_escapes() {
+        let value = parse_json("\"A\\u00e9\"").unwrap();
+        assert_eq!(value.as_str(), Some("A\u{e9}"));
+    }
+
+    #[test]
+    fn json_escape_escapes_control_characters() {
+        assert_eq!(json_escape("a\nb\tc\"d\\e"), "a\\nb\\tc\\\"d\\\\e");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn parse_json_feed_reads_items_and_attachments() {
+        let json = r#"{
+            "title": "Example",
+            "home_page_url": "http://example.com",
+            "items": [
+                {
+                    "id": "1",
+                    "url": "http://example.com/1",
+                    "title": "First",
+                    "content_text": "hello",
+                    "date_published": "2020-01-02T03:04:05Z",
+                    "attachments": [
+                        {"url": "http://example.com/a.mp3", "mime_type": "audio/mpeg", "size_in_bytes": 42}
+                    ]
+                }
+            ]
+        }"#;
+        let feed = parse_json_feed(json).unwrap();
+        assert_eq!(feed.title, "Example");
+        assert_eq!(feed.link, "http://example.com");
+        assert_eq!(feed.items.len(), 1);
+        let item = &feed.items[0];
+        assert_eq!(item.id, "1");
+        assert_eq!(item.content, "hello");
+        assert_eq!(item.enclosures.len(), 1);
+        assert_eq!(item.enclosures[0].length, Some(42));
+    }
+}

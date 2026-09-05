@@ -85,7 +85,6 @@ nothing better is available.
 
 ## Roadmap
 
-- Unit tests for the XML and JSON parsing helpers.
 - Preserve unknown extension fields instead of dropping them.
 
 ## License
