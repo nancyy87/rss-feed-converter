@@ -74,10 +74,17 @@ the `<id>` and `<updated>` elements the spec requires but the shared feed
 model doesn't otherwise track, falling back to the link or title when
 nothing better is available.
 
+JSON Feed fields the converter doesn't model directly - `icon`, `language`,
+`authors`, custom `_foo` extensions, and the same on each item - are kept
+verbatim and written back out rather than dropped, as long as the output
+format is also JSON Feed.
+
 ## Known limitations
 
-- No support for categories or other extension fields - they're silently
-  dropped on conversion.
+- RSS and Atom have no equivalent extension mechanism in this converter:
+  namespaced elements like `<media:content>` or `<itunes:...>` are still
+  silently dropped, and JSON Feed extension fields have nowhere to go when
+  converting to RSS or Atom.
 - The XML reader is a small hand-written scanner built for the shape of RSS
   2.0 and Atom specifically, not a general-purpose XML parser. Atom
   `<content type="xhtml">` bodies (inline XML rather than escaped text)
@@ -85,7 +92,8 @@ nothing better is available.
 
 ## Roadmap
 
-- Preserve unknown extension fields instead of dropping them.
+- Preserve unknown RSS/Atom extension elements (namespaced tags) the same
+  way JSON Feed extensions are now preserved.
 
 ## License
 

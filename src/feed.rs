@@ -7,6 +7,10 @@ pub struct Feed {
     pub link: String,
     pub description: String,
     pub items: Vec<Item>,
+    // JSON Feed fields we don't model directly (icon, language, custom
+    // "_foo" extensions, ...), kept so a JSON-Feed-to-JSON-Feed pass
+    // doesn't silently drop them. Empty for RSS/Atom input.
+    pub extensions: Vec<(String, JsonValue)>,
 }
 
 pub struct Item {
@@ -16,6 +20,7 @@ pub struct Item {
     pub content: String,
     pub pub_date: String,
     pub enclosures: Vec<Enclosure>,
+    pub extensions: Vec<(String, JsonValue)>,
 }
 
 pub struct Enclosure {
@@ -282,6 +287,7 @@ pub fn parse_rss(xml: &str) -> Result<Feed, String> {
         link: extract_tag(&channel, "link").unwrap_or_default(),
         description: extract_tag(&channel, "description").unwrap_or_default(),
         items: Vec::new(),
+        extensions: Vec::new(),
     };
     for raw_item in extract_all_tag(&channel, "item") {
         feed.items.push(Item {
@@ -291,6 +297,7 @@ pub fn parse_rss(xml: &str) -> Result<Feed, String> {
             content: extract_tag(&raw_item, "description").unwrap_or_default(),
             pub_date: extract_tag(&raw_item, "pubDate").unwrap_or_default(),
             enclosures: parse_enclosures_rss(&raw_item),
+            extensions: Vec::new(),
         });
     }
     Ok(feed)
@@ -390,6 +397,7 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
         link: atom_link_href(&root),
         description: extract_tag(&root, "subtitle").unwrap_or_default(),
         items: Vec::new(),
+        extensions: Vec::new(),
     };
     for raw_entry in extract_all_tag(&root, "entry") {
         let content = extract_tag(&raw_entry, "content")
@@ -405,6 +413,7 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
             content,
             pub_date,
             enclosures: parse_enclosures_atom(&raw_entry),
+            extensions: Vec::new(),
         });
     }
     Ok(feed)
@@ -483,6 +492,7 @@ pub fn write_atom(feed: &Feed) -> String {
 
 // ---------- minimal JSON reading/writing ----------
 
+#[derive(Clone)]
 pub enum JsonValue {
     Null,
     Bool(bool),
@@ -496,6 +506,13 @@ impl JsonValue {
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         match self {
             JsonValue::Object(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&Vec<(String, JsonValue)>> {
+        match self {
+            JsonValue::Object(pairs) => Some(pairs),
             _ => None,
         }
     }
@@ -688,65 +705,104 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
     JsonParser::new(input).parse_value()
 }
 
-pub fn parse_json_feed(input: &str) -> Result<Feed, String> {
-    let value = parse_json(input)?;
-    let mut feed = Feed {
-        title: value.get("title").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-        link: value
-            .get("home_page_url")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string(),
-        description: value
-            .get("description")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string(),
-        items: Vec::new(),
-    };
-    if let Some(items) = value.get("items").and_then(JsonValue::as_array) {
-        for entry in items {
-            let content = entry
-                .get("content_text")
-                .or_else(|| entry.get("content_html"))
-                .or_else(|| entry.get("summary"))
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_string();
-            let enclosures = entry
-                .get("attachments")
-                .and_then(JsonValue::as_array)
-                .map(|attachments| {
-                    attachments
-                        .iter()
-                        .filter_map(|a| {
-                            let url = a.get("url").and_then(JsonValue::as_str)?.to_string();
-                            let mime_type = a
-                                .get("mime_type")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let length = a.get("size_in_bytes").and_then(JsonValue::as_u64);
-                            Some(Enclosure { url, mime_type, length })
-                        })
-                        .collect()
+// Fields our model reads explicitly; anything else on a feed or item object
+// is kept in `extensions` and written back out verbatim rather than dropped.
+const KNOWN_FEED_FIELDS: [&str; 5] = ["version", "title", "home_page_url", "description", "items"];
+const KNOWN_ITEM_FIELDS: [&str; 7] = [
+    "id",
+    "url",
+    "title",
+    "content_text",
+    "content_html",
+    "summary",
+    "date_published",
+];
+
+fn parse_json_feed_item(entry: &JsonValue) -> Item {
+    let content = entry
+        .get("content_text")
+        .or_else(|| entry.get("content_html"))
+        .or_else(|| entry.get("summary"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let enclosures = entry
+        .get("attachments")
+        .and_then(JsonValue::as_array)
+        .map(|attachments| {
+            attachments
+                .iter()
+                .filter_map(|a| {
+                    let url = a.get("url").and_then(JsonValue::as_str)?.to_string();
+                    let mime_type = a
+                        .get("mime_type")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let length = a.get("size_in_bytes").and_then(JsonValue::as_u64);
+                    Some(Enclosure { url, mime_type, length })
                 })
-                .unwrap_or_default();
-            feed.items.push(Item {
-                id: entry.get("id").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                title: entry.get("title").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                link: entry.get("url").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                content,
-                pub_date: entry
-                    .get("date_published")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                enclosures,
-            });
+                .collect()
+        })
+        .unwrap_or_default();
+    let extensions = entry
+        .as_object()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter(|(k, _)| !KNOWN_ITEM_FIELDS.contains(&k.as_str()) && k != "attachments")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Item {
+        id: entry.get("id").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+        title: entry.get("title").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+        link: entry.get("url").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+        content,
+        pub_date: entry
+            .get("date_published")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string(),
+        enclosures,
+        extensions,
+    }
+}
+
+fn field<'a>(pairs: &'a [(String, JsonValue)], key: &str) -> Option<&'a JsonValue> {
+    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+pub fn parse_json_feed(input: &str) -> Result<Feed, String> {
+    let pairs = match parse_json(input)? {
+        JsonValue::Object(pairs) => pairs,
+        _ => return Err("top-level JSON Feed value must be an object".to_string()),
+    };
+
+    let mut items = Vec::new();
+    if let Some(raw_items) = field(&pairs, "items").and_then(JsonValue::as_array) {
+        for entry in raw_items {
+            items.push(parse_json_feed_item(entry));
         }
     }
-    Ok(feed)
+
+    let title = field(&pairs, "title").and_then(JsonValue::as_str).unwrap_or("").to_string();
+    let link = field(&pairs, "home_page_url")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let description = field(&pairs, "description")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let extensions = pairs
+        .into_iter()
+        .filter(|(k, _)| !KNOWN_FEED_FIELDS.contains(&k.as_str()))
+        .collect();
+
+    Ok(Feed { title, link, description, items, extensions })
 }
 
 fn json_escape(s: &str) -> String {
@@ -765,6 +821,26 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn write_json_value(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::String(s) => format!("\"{}\"", json_escape(s)),
+        JsonValue::Array(items) => {
+            let parts: Vec<String> = items.iter().map(write_json_value).collect();
+            format!("[{}]", parts.join(","))
+        }
+        JsonValue::Object(pairs) => {
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", json_escape(k), write_json_value(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
 pub fn write_json_feed(feed: &Feed) -> String {
     let mut out = String::new();
     out.push_str("{\n");
@@ -775,6 +851,9 @@ pub fn write_json_feed(feed: &Feed) -> String {
         "  \"description\": \"{}\",\n",
         json_escape(&feed.description)
     ));
+    for (key, value) in &feed.extensions {
+        out.push_str(&format!("  \"{}\": {},\n", json_escape(key), write_json_value(value)));
+    }
     out.push_str("  \"items\": [\n");
     for (i, item) in feed.items.iter().enumerate() {
         let id = if item.id.is_empty() { &item.link } else { &item.id };
@@ -814,6 +893,13 @@ pub fn write_json_feed(feed: &Feed) -> String {
                 out.push('\n');
             }
             out.push_str("      ]");
+        }
+        for (key, value) in &item.extensions {
+            out.push_str(&format!(
+                ",\n      \"{}\": {}",
+                json_escape(key),
+                write_json_value(value)
+            ));
         }
         out.push('\n');
         out.push_str("    }");
@@ -985,5 +1071,47 @@ mod tests {
         assert_eq!(item.content, "hello");
         assert_eq!(item.enclosures.len(), 1);
         assert_eq!(item.enclosures[0].length, Some(42));
+    }
+
+    #[test]
+    fn parse_json_feed_keeps_unknown_feed_and_item_fields_as_extensions() {
+        let json = r#"{
+            "title": "Example",
+            "language": "en-US",
+            "_custom_feed": {"a": 1},
+            "items": [
+                {
+                    "id": "1",
+                    "content_text": "hello",
+                    "_custom_item": [true, "x"]
+                }
+            ]
+        }"#;
+        let feed = parse_json_feed(json).unwrap();
+        assert_eq!(feed.extensions.len(), 2);
+        assert!(feed.extensions.iter().any(|(k, v)| k == "language" && v.as_str() == Some("en-US")));
+        assert!(feed.extensions.iter().any(|(k, _)| k == "_custom_feed"));
+        let item = &feed.items[0];
+        assert_eq!(item.extensions.len(), 1);
+        assert_eq!(item.extensions[0].0, "_custom_item");
+    }
+
+    #[test]
+    fn write_json_feed_round_trips_extensions() {
+        let json = r#"{
+            "title": "Example",
+            "language": "en-US",
+            "items": [
+                {"id": "1", "content_text": "hi", "_custom_item": 7}
+            ]
+        }"#;
+        let feed = parse_json_feed(json).unwrap();
+        let output = write_json_feed(&feed);
+        assert!(output.contains("\"language\": \"en-US\""));
+        assert!(output.contains("\"_custom_item\": 7"));
+        // Extensions must round-trip through a second parse too.
+        let reparsed = parse_json_feed(&output).unwrap();
+        assert_eq!(reparsed.extensions.len(), 1);
+        assert_eq!(reparsed.items[0].extensions.len(), 1);
     }
 }
