@@ -11,6 +11,15 @@ pub struct Feed {
     // "_foo" extensions, ...), kept so a JSON-Feed-to-JSON-Feed pass
     // doesn't silently drop them. Empty for RSS/Atom input.
     pub extensions: Vec<(String, JsonValue)>,
+    // Namespaced elements from an RSS/Atom source we don't understand
+    // (media:content, dc:creator, atom:link, ...), kept as raw markup so an
+    // RSS/Atom-to-RSS/Atom pass doesn't silently drop them. Empty for JSON
+    // Feed input, since JSON Feed has no equivalent extension mechanism.
+    pub xml_extensions: Vec<String>,
+    // xmlns:prefix declarations pulled off the source root element, needed
+    // so the prefixes used in xml_extensions stay bound when we write them
+    // back out. Empty for JSON Feed input.
+    pub xml_namespaces: Vec<(String, String)>,
 }
 
 pub struct Item {
@@ -21,6 +30,7 @@ pub struct Item {
     pub pub_date: String,
     pub enclosures: Vec<Enclosure>,
     pub extensions: Vec<(String, JsonValue)>,
+    pub xml_extensions: Vec<String>,
 }
 
 pub struct Enclosure {
@@ -218,6 +228,101 @@ fn extract_attr_value(tag_attrs: &str, attr: &str) -> Option<String> {
     None
 }
 
+/// Walks the top-level elements of `s` and returns each one's tag name
+/// alongside its raw full markup (open tag through matching close tag, or
+/// the bare self-closing tag). Like `extract_all_tag`, matching is by tag
+/// name rather than real nesting depth, which is fine for well-formed feed
+/// markup.
+fn top_level_elements(s: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    while pos < s.len() {
+        let rel = match s[pos..].find('<') {
+            Some(r) => r,
+            None => break,
+        };
+        let start = pos + rel;
+        if s[start..].starts_with("<!--") {
+            pos = match s[start..].find("-->") {
+                Some(i) => start + i + 3,
+                None => break,
+            };
+            continue;
+        }
+        if s[start..].starts_with("<!") || s[start..].starts_with("<?") {
+            pos = match s[start..].find('>') {
+                Some(i) => start + i + 1,
+                None => break,
+            };
+            continue;
+        }
+        let after = start + 1;
+        let name_end = match s[after..].find(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+            Some(i) => after + i,
+            None => break,
+        };
+        let name = s[after..name_end].to_string();
+        let close_of_open = match s[after..].find('>') {
+            Some(i) => after + i,
+            None => break,
+        };
+        if bytes[close_of_open - 1] == b'/' {
+            result.push((name, s[start..close_of_open + 1].to_string()));
+            pos = close_of_open + 1;
+            continue;
+        }
+        let content_start = close_of_open + 1;
+        let close_needle = format!("</{}>", name);
+        let content_end = match s[content_start..].find(&close_needle) {
+            Some(i) => content_start + i + close_needle.len(),
+            None => break,
+        };
+        result.push((name, s[start..content_end].to_string()));
+        pos = content_end;
+    }
+    result
+}
+
+/// Returns the raw markup of every top-level namespaced element (tag names
+/// containing a `:`) in `s` - the RSS/Atom extension elements we don't parse
+/// into our own model, kept so they round-trip instead of getting dropped.
+fn xml_extensions(s: &str) -> Vec<String> {
+    top_level_elements(s)
+        .into_iter()
+        .filter(|(name, _)| name.contains(':'))
+        .map(|(_, raw)| raw)
+        .collect()
+}
+
+/// Reads every `xmlns:prefix="uri"` declaration out of a tag's raw
+/// attribute text, so a preserved extension element's namespace prefix
+/// (e.g. `media:` in `<media:content>`) stays bound when re-emitted.
+fn extract_xmlns_decls(tag_attrs: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let needle = "xmlns:";
+    let mut idx = 0;
+    while let Some(rel) = tag_attrs[idx..].find(needle) {
+        let pos = idx + rel;
+        if pos > 0 && !tag_attrs.as_bytes()[pos - 1].is_ascii_whitespace() {
+            idx = pos + needle.len();
+            continue;
+        }
+        let name_start = pos + needle.len();
+        let name_end = tag_attrs[name_start..]
+            .find('=')
+            .map(|i| name_start + i)
+            .unwrap_or(tag_attrs.len());
+        let prefix = tag_attrs[name_start..name_end].trim().to_string();
+        let attr_name = format!("xmlns:{}", prefix);
+        if let Some(value) = extract_attr_value(tag_attrs, &attr_name) {
+            result.push((prefix, value));
+        }
+        idx = name_end;
+    }
+    result
+}
+
 /// Picks the href of an Atom `<link>` element, preferring `rel="alternate"`
 /// (the default per the spec when `rel` is omitted) over other relations
 /// like `self` or `enclosure`.
@@ -282,12 +387,18 @@ fn parse_enclosures_rss(s: &str) -> Vec<Enclosure> {
 
 pub fn parse_rss(xml: &str) -> Result<Feed, String> {
     let channel = extract_tag(xml, "channel").ok_or("no <channel> element found")?;
+    let xml_namespaces = extract_all_tag_attrs(xml, "rss")
+        .first()
+        .map(|attrs| extract_xmlns_decls(attrs))
+        .unwrap_or_default();
     let mut feed = Feed {
         title: extract_tag(&channel, "title").unwrap_or_default(),
         link: extract_tag(&channel, "link").unwrap_or_default(),
         description: extract_tag(&channel, "description").unwrap_or_default(),
         items: Vec::new(),
         extensions: Vec::new(),
+        xml_extensions: xml_extensions(&channel),
+        xml_namespaces,
     };
     for raw_item in extract_all_tag(&channel, "item") {
         feed.items.push(Item {
@@ -298,6 +409,7 @@ pub fn parse_rss(xml: &str) -> Result<Feed, String> {
             pub_date: extract_tag(&raw_item, "pubDate").unwrap_or_default(),
             enclosures: parse_enclosures_rss(&raw_item),
             extensions: Vec::new(),
+            xml_extensions: xml_extensions(&raw_item),
         });
     }
     Ok(feed)
@@ -332,13 +444,21 @@ fn escape_xml_attr(s: &str) -> String {
 pub fn write_rss(feed: &Feed) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<rss version=\"2.0\">\n<channel>\n");
+    out.push_str("<rss version=\"2.0\"");
+    for (prefix, uri) in &feed.xml_namespaces {
+        out.push_str(&format!(" xmlns:{}=\"{}\"", prefix, escape_xml_attr(uri)));
+    }
+    out.push_str(">\n<channel>\n");
     out.push_str(&format!("<title>{}</title>\n", escape_xml(&feed.title)));
     out.push_str(&format!("<link>{}</link>\n", escape_xml(&feed.link)));
     out.push_str(&format!(
         "<description>{}</description>\n",
         escape_xml(&feed.description)
     ));
+    for extension in &feed.xml_extensions {
+        out.push_str(extension);
+        out.push('\n');
+    }
     for item in &feed.items {
         out.push_str("<item>\n");
         out.push_str(&format!("<title>{}</title>\n", escape_xml(&item.title)));
@@ -366,6 +486,10 @@ pub fn write_rss(feed: &Feed) -> String {
                 enclosure.length.map(|l| format!(" length=\"{}\"", l)).unwrap_or_default()
             ));
         }
+        for extension in &item.xml_extensions {
+            out.push_str(extension);
+            out.push('\n');
+        }
         out.push_str("</item>\n");
     }
     out.push_str("</channel>\n</rss>\n");
@@ -392,12 +516,18 @@ fn parse_enclosures_atom(s: &str) -> Vec<Enclosure> {
 
 pub fn parse_atom(xml: &str) -> Result<Feed, String> {
     let root = extract_tag(xml, "feed").ok_or("no <feed> element found")?;
+    let xml_namespaces = extract_all_tag_attrs(xml, "feed")
+        .first()
+        .map(|attrs| extract_xmlns_decls(attrs))
+        .unwrap_or_default();
     let mut feed = Feed {
         title: extract_tag(&root, "title").unwrap_or_default(),
         link: atom_link_href(&root),
         description: extract_tag(&root, "subtitle").unwrap_or_default(),
         items: Vec::new(),
         extensions: Vec::new(),
+        xml_extensions: xml_extensions(&root),
+        xml_namespaces,
     };
     for raw_entry in extract_all_tag(&root, "entry") {
         let content = extract_tag(&raw_entry, "content")
@@ -414,6 +544,7 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
             pub_date,
             enclosures: parse_enclosures_atom(&raw_entry),
             extensions: Vec::new(),
+            xml_extensions: xml_extensions(&raw_entry),
         });
     }
     Ok(feed)
@@ -422,7 +553,11 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
 pub fn write_atom(feed: &Feed) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
+    out.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\"");
+    for (prefix, uri) in &feed.xml_namespaces {
+        out.push_str(&format!(" xmlns:{}=\"{}\"", prefix, escape_xml_attr(uri)));
+    }
+    out.push_str(">\n");
     out.push_str(&format!("<title>{}</title>\n", escape_xml(&feed.title)));
     // Atom requires a feed <id>; fall back to the title when there's no link
     // to use, since the source feed may not carry anything id-shaped at all.
@@ -447,6 +582,10 @@ pub fn write_atom(feed: &Feed) -> String {
         .unwrap_or_default();
     if !feed_updated.is_empty() {
         out.push_str(&format!("<updated>{}</updated>\n", escape_xml(&feed_updated)));
+    }
+    for extension in &feed.xml_extensions {
+        out.push_str(extension);
+        out.push('\n');
     }
     for item in &feed.items {
         out.push_str("<entry>\n");
@@ -483,6 +622,10 @@ pub fn write_atom(feed: &Feed) -> String {
                 },
                 enclosure.length.map(|l| format!(" length=\"{}\"", l)).unwrap_or_default()
             ));
+        }
+        for extension in &item.xml_extensions {
+            out.push_str(extension);
+            out.push('\n');
         }
         out.push_str("</entry>\n");
     }
@@ -767,6 +910,7 @@ fn parse_json_feed_item(entry: &JsonValue) -> Item {
             .to_string(),
         enclosures,
         extensions,
+        xml_extensions: Vec::new(),
     }
 }
 
@@ -802,7 +946,15 @@ pub fn parse_json_feed(input: &str) -> Result<Feed, String> {
         .filter(|(k, _)| !KNOWN_FEED_FIELDS.contains(&k.as_str()))
         .collect();
 
-    Ok(Feed { title, link, description, items, extensions })
+    Ok(Feed {
+        title,
+        link,
+        description,
+        items,
+        extensions,
+        xml_extensions: Vec::new(),
+        xml_namespaces: Vec::new(),
+    })
 }
 
 fn json_escape(s: &str) -> String {
@@ -997,6 +1149,85 @@ mod tests {
     fn xml_root_tag_detects_atom_feed() {
         let xml = "<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>";
         assert_eq!(xml_root_tag(xml), Some("feed".to_string()));
+    }
+
+    #[test]
+    fn top_level_elements_matches_by_tag_name_not_nesting() {
+        let xml = "<a>x</a><media:content url=\"http://x\"/><b><a>nested</a></b>";
+        let names: Vec<String> = top_level_elements(xml).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["a".to_string(), "media:content".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn xml_extensions_keeps_only_namespaced_top_level_tags() {
+        let xml = r#"<title>t</title><media:content url="http://x/y.mp3"/><dc:creator>Jane</dc:creator>"#;
+        let extensions = xml_extensions(xml);
+        assert_eq!(
+            extensions,
+            vec![
+                "<media:content url=\"http://x/y.mp3\"/>".to_string(),
+                "<dc:creator>Jane</dc:creator>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_xmlns_decls_reads_prefixed_declarations_only() {
+        let attrs = " version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"";
+        let decls = extract_xmlns_decls(attrs);
+        assert_eq!(
+            decls,
+            vec![
+                ("atom".to_string(), "http://www.w3.org/2005/Atom".to_string()),
+                ("dc".to_string(), "http://purl.org/dc/elements/1.1/".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rss_keeps_namespaced_extensions_and_declarations() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Example</title>
+<link>http://example.com</link>
+<description>desc</description>
+<atom:link href="http://example.com/feed" rel="self"/>
+<item>
+<title>Post</title>
+<dc:creator>Jane</dc:creator>
+</item>
+</channel>
+</rss>"#;
+        let feed = parse_rss(xml).unwrap();
+        assert_eq!(
+            feed.xml_namespaces,
+            vec![("dc".to_string(), "http://purl.org/dc/elements/1.1/".to_string())]
+        );
+        assert_eq!(feed.xml_extensions, vec!["<atom:link href=\"http://example.com/feed\" rel=\"self\"/>".to_string()]);
+        assert_eq!(feed.items[0].xml_extensions, vec!["<dc:creator>Jane</dc:creator>".to_string()]);
+    }
+
+    #[test]
+    fn write_rss_round_trips_namespaced_extensions() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Example</title>
+<link>http://example.com</link>
+<description>desc</description>
+<item>
+<title>Post</title>
+<dc:creator>Jane</dc:creator>
+</item>
+</channel>
+</rss>"#;
+        let feed = parse_rss(xml).unwrap();
+        let output = write_rss(&feed);
+        assert!(output.contains("xmlns:dc=\"http://purl.org/dc/elements/1.1/\""));
+        assert!(output.contains("<dc:creator>Jane</dc:creator>"));
+        let reparsed = parse_rss(&output).unwrap();
+        assert_eq!(reparsed.items[0].xml_extensions, vec!["<dc:creator>Jane</dc:creator>".to_string()]);
     }
 
     #[test]
