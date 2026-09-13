@@ -112,8 +112,10 @@ fn is_tag_boundary(c: char) -> bool {
     c == '>' || c == '/' || c.is_whitespace()
 }
 
-/// Finds the first `<tag ...>...</tag>` in `s` and returns its decoded inner text.
-fn extract_tag(s: &str, tag: &str) -> Option<String> {
+/// Finds the first `<tag ...>...</tag>` in `s` and returns its raw
+/// (undecoded, CDATA-untouched) inner text, or `Some("")` for a
+/// self-closing `<tag/>`.
+fn extract_tag_raw(s: &str, tag: &str) -> Option<String> {
     let open_needle = format!("<{}", tag);
     let mut search_from = 0;
     loop {
@@ -133,8 +135,13 @@ fn extract_tag(s: &str, tag: &str) -> Option<String> {
         let close_needle = format!("</{}>", tag);
         let rel_end = s[content_start..].find(&close_needle)?;
         let content_end = content_start + rel_end;
-        return Some(strip_cdata(&s[content_start..content_end]));
+        return Some(s[content_start..content_end].to_string());
     }
+}
+
+/// Finds the first `<tag ...>...</tag>` in `s` and returns its decoded inner text.
+fn extract_tag(s: &str, tag: &str) -> Option<String> {
+    extract_tag_raw(s, tag).map(|raw| strip_cdata(&raw))
 }
 
 /// Finds every top-level `<tag ...>...</tag>` block in `s` and returns each
@@ -514,6 +521,26 @@ fn parse_enclosures_atom(s: &str) -> Vec<Enclosure> {
         .collect()
 }
 
+/// Reads an Atom text construct (`<content>` or `<summary>`) as plain HTML
+/// markup. Per the Atom spec these can carry `type="xhtml"`, which wraps
+/// the actual markup in an inline `<div xmlns="...">` rather than escaping
+/// it as text the way `type="html"` does. Unwrap that div so `Item::content`
+/// always ends up holding the same kind of raw HTML string regardless of
+/// which content type the source used, instead of leaving the xhtml div
+/// wrapper (and its xmlns attribute) sitting in the content body.
+fn atom_text_construct(entry: &str, tag: &str) -> Option<String> {
+    let content_type = extract_all_tag_attrs(entry, tag)
+        .into_iter()
+        .next()
+        .and_then(|attrs| extract_attr_value(&attrs, "type"));
+    let raw = extract_tag_raw(entry, tag)?;
+    if content_type.as_deref() == Some("xhtml") {
+        Some(extract_tag(&raw, "div").unwrap_or_else(|| strip_cdata(&raw)))
+    } else {
+        Some(strip_cdata(&raw))
+    }
+}
+
 pub fn parse_atom(xml: &str) -> Result<Feed, String> {
     let root = extract_tag(xml, "feed").ok_or("no <feed> element found")?;
     let xml_namespaces = extract_all_tag_attrs(xml, "feed")
@@ -530,8 +557,8 @@ pub fn parse_atom(xml: &str) -> Result<Feed, String> {
         xml_namespaces,
     };
     for raw_entry in extract_all_tag(&root, "entry") {
-        let content = extract_tag(&raw_entry, "content")
-            .or_else(|| extract_tag(&raw_entry, "summary"))
+        let content = atom_text_construct(&raw_entry, "content")
+            .or_else(|| atom_text_construct(&raw_entry, "summary"))
             .unwrap_or_default();
         let pub_date = extract_tag(&raw_entry, "published")
             .or_else(|| extract_tag(&raw_entry, "updated"))
@@ -1137,6 +1164,35 @@ mod tests {
     fn atom_link_href_falls_back_when_no_alternate_present() {
         let xml = "<link rel=\"self\" href=\"http://self\"/>";
         assert_eq!(atom_link_href(xml), "http://self");
+    }
+
+    #[test]
+    fn atom_text_construct_unwraps_xhtml_div() {
+        let entry = r#"<entry><content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>Hello <b>world</b></p></div></content></entry>"#;
+        assert_eq!(
+            atom_text_construct(entry, "content"),
+            Some("<p>Hello <b>world</b></p>".to_string())
+        );
+    }
+
+    #[test]
+    fn atom_text_construct_decodes_html_type_content() {
+        let entry = r#"<entry><content type="html">&lt;p&gt;Hi&lt;/p&gt;</content></entry>"#;
+        assert_eq!(atom_text_construct(entry, "content"), Some("<p>Hi</p>".to_string()));
+    }
+
+    #[test]
+    fn parse_atom_reads_xhtml_entry_content() {
+        let xml = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Example</title>
+<entry>
+<title>Post</title>
+<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>Hello <b>world</b></p></div></content>
+</entry>
+</feed>"#;
+        let feed = parse_atom(xml).unwrap();
+        assert_eq!(feed.items[0].content, "<p>Hello <b>world</b></p>");
     }
 
     #[test]

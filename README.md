@@ -87,13 +87,15 @@ format is also JSON Feed.
   converting to RSS or Atom.
 - The XML reader is a small hand-written scanner built for the shape of RSS
   2.0 and Atom specifically, not a general-purpose XML parser. Atom
-  `<content type="xhtml">` bodies (inline XML rather than escaped text)
-  round-trip as raw markup rather than being reserialized.
+  `<title>` and `<subtitle>` carrying `type="xhtml"` still round-trip as raw
+  markup (including the wrapper div) rather than being reserialized; only
+  entry `<content>`/`<summary>` get that treatment so far.
 
 ## Roadmap
 
-- Preserve unknown RSS/Atom extension elements (namespaced tags) the same
-  way JSON Feed extensions are now preserved.
+- Reserialize `<title>`/`<subtitle>` the same way entry `<content>` and
+  `<summary>` now are, so `type="xhtml"` is handled consistently across all
+  of Atom's text constructs.
 
 ## License
 
